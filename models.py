@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -474,7 +475,26 @@ class Model(nn.Module):
         log_prob = F.log_softmax(self.smax_fc(hidden), 2)  # seq_len, batch, n_classes
         return log_prob
 
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, reduction="mean", gamma=0, eps=1e-7):
+        super(FocalLoss, self).__init__()
+        self.weight = weight
+        self.gamma = gamma
+        self.eps = eps
+        self.ce = torch.nn.CrossEntropyLoss(weight=weight, reduction=reduction)
 
+    def forward(self, pred, target, mask):
+        mask_ = mask.view(-1, 1)
+        if type(self.weight) == type(None):
+            logp = self.ce(pred * mask_, target) / torch.sum(mask)
+            p = torch.exp(-logp)
+        else:
+            logp = self.ce(pred * mask_, target) / torch.sum(
+                self.weight[target] * mask_.squeeze()
+            )
+            p = torch.exp(-logp)
+        loss = (1 - p) ** self.gamma * logp
+        return loss.mean()
 
 
 
@@ -585,6 +605,7 @@ class UnMaskedWeightedNLLLoss(nn.Module):
             loss = self.loss(pred, target) \
                    / torch.sum(self.weight[target])
         return loss
+    
 class LSTMModel(nn.Module):
 
     def __init__(self, D_m, D_e, D_h, n_classes=7, dropout=0.5, attention=False):
@@ -625,6 +646,50 @@ class LSTMModel(nn.Module):
         log_prob = F.log_softmax(self.smax_fc(hidden), 2)
         return log_prob, alpha, alpha_f, alpha_b
 
+class LSTMModel2(nn.Module):
+    def __init__(self, D_m, D_e, D_h, n_classes=7, dropout=0.5, attention=False):
+        super(LSTMModel2, self).__init__()
+
+        self.dropout = nn.Dropout(dropout)
+        self.attention = attention
+        self.lstm = nn.LSTM(
+            input_size=D_m,
+            hidden_size=D_e,
+            num_layers=2,
+            bidirectional=True,
+            dropout=dropout,
+        )
+
+        if self.attention:
+            self.matchatt = MatchingAttention(2 * D_e, 2 * D_e, att_type="general2")
+
+        self.linear = nn.Linear(2 * D_e, D_h)
+        self.smax_fc = nn.Linear(D_h, n_classes)
+
+    def forward(self, U, qmask, umask):
+        """
+        U -> seq_len, batch, D_m
+        qmask -> seq_len, batch, party
+        """
+        emotions, hidden = self.lstm(U)
+        alpha, alpha_f, alpha_b = [], [], []
+
+        if self.attention:
+            att_emotions = []
+            alpha = []
+            for t in emotions:
+                att_em, alpha_ = self.matchatt(emotions, t, mask=umask)
+                att_emotions.append(att_em.unsqueeze(0))
+                alpha.append(alpha_[:, 0, :])
+            att_emotions = torch.cat(att_emotions, dim=0)
+            hidden = F.relu(self.linear(att_emotions))
+        else:
+            hidden = F.relu(self.linear(emotions))
+
+        hidden = self.dropout(hidden)
+        log_prob = F.log_softmax(self.smax_fc(hidden), 2)
+        # print("log_prob.size() = ", log_prob.size()) # log_prob.size() =  torch.Size([94, 32, 6])
+        return log_prob, alpha, alpha_f, alpha_b
 
 class E2ELSTMModel(nn.Module):
 
@@ -677,3 +742,362 @@ class E2ELSTMModel(nn.Module):
         hidden = self.dropout(hidden)
         log_prob = F.log_softmax(self.smax_fc(hidden), 2)
         return log_prob, alpha, alpha_f, alpha_b
+
+# Test > 以下是GAN-FFN的代码，目前处于测试版本
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.2, max_len: int = 110):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
+        )
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor, shape [seq_len, batch_size, embedding_dim]
+        """
+        x = x + self.pe[: x.size(0)]
+        return self.dropout(x)
+
+
+class AcousticGenerator(nn.Module):
+    """
+    acoustic : (seq_len, batch_size, 100)
+    fusion : (seq_len, batch_size, D_h)
+    acoustic -> fusion
+    """
+
+    def __init__(self, D_h,features, dropout=0.2):
+        super(AcousticGenerator, self).__init__()
+        self.features = features
+        self.position_encoding = PositionalEncoding(self.features)
+        self.encoder_layer = nn.TransformerEncoderLayer(d_model=self.features, nhead=10)
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=self.encoder_layer, num_layers=8
+        )
+        self.fc1 = nn.Linear(self.features, 512)  # 尝试一下100->512->100
+        self.fc2 = nn.Linear(512, D_h)
+
+        # self.relu = nn.ReLU()
+        self.gelu = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, acoustic):
+        acoustic_fusion = self.position_encoding(acoustic)
+        acoustic_fusion_transformered = self.gelu(
+            self.transformer_encoder(acoustic_fusion)
+        )
+        acoustic_fusion = self.dropout(acoustic_fusion_transformered)
+        acoustic_fusion = self.gelu(self.dropout(self.fc1(acoustic_fusion)))
+        acoustic_fusion = self.gelu(self.dropout(self.fc2(acoustic_fusion)))
+        # acoustic_fusion += acoustic_fusion_transformered
+
+        return acoustic_fusion
+
+
+class VisualGenerator(nn.Module):
+    """
+    visual : (seq_len, batch_size, 512)
+    fusion : (seq_len, batch_size, D_h)
+    visual -> fusion
+    """
+
+    def __init__(self, D_h,features, dropout=0.2):
+        super(VisualGenerator, self).__init__()
+        self.features = features
+        self.position_encoding = PositionalEncoding(self.features)
+        self.encoder_layer = nn.TransformerEncoderLayer(d_model=self.features, nhead=8)
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=self.encoder_layer, num_layers=8
+        )
+        self.fc1 = nn.Linear(self.features, 1024)
+        self.fc2 = nn.Linear(1024, D_h)
+
+        # self.relu = nn.ReLU()
+        self.gelu = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, acoustic):
+        visual_fusion = self.position_encoding(acoustic)
+        visual_fusion_transformered = self.gelu(self.transformer_encoder(visual_fusion))
+        visual_fusion = self.dropout(visual_fusion_transformered)
+        visual_fusion = self.gelu(self.dropout(self.fc1(visual_fusion)))
+        # visual_fusion += visual_fusion_transformered
+        visual_fusion = self.gelu(self.dropout(self.fc2(visual_fusion)))
+
+        return visual_fusion
+
+
+class TextGenerator(nn.Module):
+    """
+    text : (seq_len, batch_size, 100)
+    fusion : (seq_len, batch_size, D_h)
+    text -> fusion
+    """
+
+    def __init__(self, D_h,features, dropout=0.2):
+        super(TextGenerator, self).__init__()
+        self.features = features
+        self.position_encoding = PositionalEncoding(self.features)
+        self.encoder_layer = nn.TransformerEncoderLayer(d_model=self.features, nhead=10)
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=self.encoder_layer, num_layers=8
+        )
+        self.fc1 = nn.Linear(self.features, 512)
+        self.fc2 = nn.Linear(512, D_h)
+        # self.relu = nn.ReLU()
+        self.gelu = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, acoustic):
+        text_fusion = self.position_encoding(acoustic)
+        text_fusion_transformered = self.gelu(self.transformer_encoder(text_fusion))
+        text_fusion = self.dropout(text_fusion_transformered)
+        text_fusion = self.gelu(self.dropout(self.fc1(text_fusion)))
+        text_fusion = self.gelu(self.dropout(self.fc2(text_fusion)))
+        # text_fusion += text_fusion_transformered
+
+        return text_fusion
+
+
+class AcousticDiscriminator(nn.Module):
+    """
+    fusion : (seq_len, batch_size, D_h)
+    prob : (seq_len, batch_size)
+    fusion (from text and visual) -> prob
+    """
+
+    def __init__(self, D_h,features,  dropout=0.2):
+        super(AcousticDiscriminator, self).__init__()
+        self.features = features
+        self.position_encoding = PositionalEncoding(D_h)
+        self.encoder_layer = nn.TransformerEncoderLayer(d_model=D_h, nhead=10)
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=self.encoder_layer, num_layers=8
+        )
+        self.fc1 = nn.Linear(D_h, 64)
+        self.fc2 = nn.Linear(64, 16)
+        self.fc3 = nn.Linear(16, 1)
+        # self.relu = nn.ReLU()
+        self.gelu = nn.GELU()
+        self.sigmoid = nn.Sigmoid()
+        # self.norm = nn.BatchNorm1d(32) # batch_size = 32
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, acoustic_fusion):
+        prob = self.position_encoding(acoustic_fusion)
+        prob = self.transformer_encoder(prob)
+        prob = self.gelu(prob)
+        prob = self.gelu(self.dropout(self.fc1(prob)))
+        prob = self.gelu(self.dropout(self.fc2(prob)))
+        prob = self.sigmoid(self.dropout(self.fc3(prob)))
+        return prob  # (seq_len, batch_size, 1)
+
+
+class VisualDiscriminator(nn.Module):
+    """
+    fusion : (seq_len, batch_size, D_h)
+    prob : (seq_len, batch_size)
+    fusion (from text and acoustic) -> prob
+    """
+
+    def __init__(self, D_h,features, dropout=0.2):
+        super(VisualDiscriminator, self).__init__()
+        self.features = features
+        self.position_encoding = PositionalEncoding(D_h)
+        self.encoder_layer = nn.TransformerEncoderLayer(d_model=D_h, nhead=10)
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=self.encoder_layer, num_layers=8
+        )
+        self.object = nn.Linear(self.features, 100)  # 用来处理real_visual 输入为512个维度
+        self.fc1 = nn.Linear(D_h, 64)
+        self.fc2 = nn.Linear(64, 16)
+        self.fc3 = nn.Linear(16, 1)
+        # self.relu = nn.ReLU()
+        self.gelu = nn.GELU()
+        self.sigmoid = nn.Sigmoid()
+        # self.norm = nn.BatchNorm1d(32) # batch_size = 32
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, visual_fusion):
+        if visual_fusion.size(-1) == self.features:
+            visual_fusion = self.object(visual_fusion)
+        prob = self.position_encoding(visual_fusion)
+        # print("visual_fusion.shape = ", visual_fusion.shape) # torch.Size([94, 32, 512])
+        prob = self.transformer_encoder(prob)
+        prob = self.gelu(prob)
+        prob = self.gelu(self.dropout(self.fc1(prob)))
+        prob = self.gelu(self.dropout(self.fc2(prob)))
+        prob = self.sigmoid(self.dropout(self.fc3(prob)))
+        return prob  # (seq_len, batch_size, 1)
+
+
+class TextDiscriminator(nn.Module):
+    """
+    fusion : (seq_len, batch_size, D_h)
+    prob : (seq_len, batch_size)
+    fusion (from visual and acoustic) -> prob
+    """
+
+    def __init__(self, D_h,features,  dropout=0.2):
+        super(TextDiscriminator, self).__init__()
+        self.features = features
+        self.position_encoding = PositionalEncoding(D_h)
+        self.encoder_layer = nn.TransformerEncoderLayer(d_model=D_h, nhead=10)
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=self.encoder_layer, num_layers=8
+        )
+        self.fc1 = nn.Linear(D_h, 64)
+        self.fc2 = nn.Linear(64, 16)
+        self.fc3 = nn.Linear(16, 1)
+        # self.relu = nn.ReLU()
+        self.gelu = nn.GELU()
+        self.sigmoid = nn.Sigmoid()
+        # self.norm = nn.BatchNorm1d(32) # batch_size = 32
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, text_fusion):
+        prob = self.position_encoding(text_fusion)
+        prob = self.transformer_encoder(prob)
+        prob = self.gelu(prob)
+        prob = self.gelu(self.dropout(self.fc1(prob)))
+        prob = self.gelu(self.dropout(self.fc2(prob)))
+        prob = self.sigmoid(self.dropout(self.fc3(prob)))
+        return prob  # (seq_len, batch_size, 1)
+
+
+"""
+这是我的基于GAN的特征融合网络(GAN-Feature Fusion Network)
+"""
+
+
+class GAN_FFN(nn.Module):
+    """
+    acoustic_generator, visual_generator, text_generator are trained in GAN
+    """
+
+    def __init__(
+        self,
+        acoustic_generator: AcousticGenerator,
+        visual_generator: VisualGenerator,
+        text_generator: TextGenerator,
+        n_classes=6,
+        dropout=0.2,
+    ):
+        super(GAN_FFN, self).__init__()
+        self.n_classes = n_classes
+
+        self.acoustic_generator = acoustic_generator
+        self.visual_generator = visual_generator
+        self.text_generator = text_generator
+
+        self.lstm = nn.LSTM(100, n_classes, bidirectional=False)
+        # self.attention = nn.MultiheadAttention(embed_dim=100, num_heads=4, dropout=0.2)
+        self.gelu = nn.GELU()
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.smax_fc = nn.Linear(32*2, n_classes)
+
+        self.fc = nn.Linear(100, n_classes)
+
+    def forward(self, acoustic, visual, text):
+        alpha, alpha_f, alpha_b = [], [], []
+
+        # print("acoustic.size() = ", acoustic.size()) # torch.Size([94, 32, 200])
+        # print("visual.size() = ", visual.size()) # torch.Size([94, 32, 2])
+        # print("text.size() = ", text.size()) # torch.Size([32, 94])
+        acoustic_fusion = self.acoustic_generator(acoustic)  # (seq_len, batch_size, D_h)
+        visual_fusion = self.visual_generator(visual)  # (seq_len, batch_size, D_h)
+        text_fusion = self.text_generator(text)  # (seq_len, batch_size, D_h)
+
+        fusion = acoustic_fusion + visual_fusion + text_fusion  # 如果只用这个有59.14
+
+        # attention_out, _ = self.attention(fusion, fusion, fusion)
+        # attention_out = self.dropout(attention_out)
+        fc_out = self.fc(fusion)
+        log_prob = F.log_softmax(fc_out, 2)
+
+        # fc_out = self.dropout(self.fc(fusion))
+        # lstm_out, _ = self.lstm(fusion)
+        # lstm_out = self.dropout(lstm_out)
+        
+        # fc_log_prob = F.log_softmax(fc_out, 2)
+        # lstm_log_prob = F.log_softmax(lstm_out, 2)
+        # log_prob = (fc_log_prob + lstm_log_prob) / 2
+
+        # log_prob = torch.cat([log_prob[:, j, :][:seq_lengths[j]] for j in range(len(seq_lengths))])
+        # print("log_prob.size() = ", log_prob.size()) # torch.Size([94, 32, 6])
+
+        return log_prob, alpha, alpha_f, alpha_b  # (所有句子去掉填充的总长度, n_classes)
+
+
+class GAN_FFN_DialogueRNN(nn.Module):
+    """
+    acoustic_generator, visual_generator, text_generator are trained in GAN
+    """
+
+    def __init__(
+        self,
+        acoustic_generator: AcousticGenerator,
+        visual_generator: VisualGenerator,
+        text_generator: TextGenerator,
+        D_m,
+        D_g,
+        D_p,
+        D_e,
+        D_h,
+        D_a,
+        n_classes,
+        listener_state,
+        context_attention,
+        dropout_rec,
+        dropout
+    ):
+        super(GAN_FFN_DialogueRNN, self).__init__()
+        self.n_classes = n_classes
+
+        self.acoustic_generator = acoustic_generator
+        self.visual_generator = visual_generator
+        self.text_generator = text_generator
+
+        self.gelu = nn.GELU()
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+        self.bi_model = BiModel(
+            D_m=D_m,
+            D_g=D_g,
+            D_p=D_p,
+            D_e=D_e,
+            D_h=D_h,
+            n_classes=n_classes,
+            listener_state=listener_state,
+            context_attention=context_attention,
+            D_a=D_a,
+            dropout_rec=dropout_rec,
+            dropout=dropout,
+        )
+
+        self.fc1 = nn.Linear(100, n_classes)
+
+    def forward(self, acoustic, visual, text, qmask, umask):
+        alpha, alpha_f, alpha_b = [], [], []
+
+        acoustic_fusion = self.acoustic_generator(
+            acoustic
+        )  # (seq_len, batch_size, D_h)
+        visual_fusion = self.visual_generator(visual)  # (seq_len, batch_size, D_h)
+        text_fusion = self.text_generator(text)  # (seq_len, batch_size, D_h)
+
+
+        fusion = acoustic_fusion + visual_fusion + text_fusion  # 如果只用这个有59.14
+
+        log_prob, alpha, alpha_f, alpha_b = self.bi_model(fusion, qmask, umask)
+
+        return log_prob, alpha, alpha_f, alpha_b  # (所有句子去掉填充的总长度, n_classes)
