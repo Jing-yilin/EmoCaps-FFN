@@ -1,10 +1,12 @@
 import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
+# from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler, Normalizer
 import pickle
 import pandas as pd
 import numpy as np
 import json
+import sys
 
 class IEMOCAPDataset(Dataset):
 
@@ -23,6 +25,13 @@ class IEMOCAPDataset(Dataset):
         self.keys = [x for x in (self.trainVid if train else self.testVid)]
 
         self.len = len(self.keys)
+
+        # 归一化
+        # Loss 0.6901 F1-score 72.11
+        for vid in self.keys:
+            self.videoText[vid] = (self.videoText[vid] - np.mean(self.videoText[vid])) / np.std(self.videoText[vid])
+            self.videoVisual[vid] = (self.videoVisual[vid] - np.mean(self.videoVisual[vid])) / np.std(self.videoVisual[vid])
+            self.videoAudio[vid] = (self.videoAudio[vid] - np.mean(self.videoAudio[vid])) / np.std(self.videoAudio[vid])
 
     def __getitem__(self, index):
         vid = self.keys[index]
