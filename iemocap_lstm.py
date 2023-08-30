@@ -66,6 +66,20 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, optimizer=None,
 
         textf, visuf, acouf, qmask, umask, label = \
             [d.cuda() for d in data[:-1]] if cuda else data[:-1]
+        
+        # test > show shapes
+        # print("textf.shape: ", textf.shape) # seq_len, batch_size, 100
+        # print("visuf.shape: ", visuf.shape) # seq_len, batch_size, 256
+        # print("acouf.shape: ", acouf.shape) # seq_len, batch_size, 100
+        # print("qmask.shape: ", qmask.shape) # seq_len, batch_size, 2
+        # print("umask.shape: ", umask.shape) # seq_len, batch_size
+        # print("label.shape: ", label.shape) # seq_len, batch_size
+        # 打印方差、均值
+        # print(f"textf.var: {textf.var()}, textf.mean: {textf.mean()}")
+        # print(f"visuf.var: {visuf.var()}, visuf.mean: {visuf.mean()}")
+        # print(f"acouf.var: {acouf.var()}, acouf.mean: {acouf.mean()}")
+        # sys.exit()
+        # test < show shapes
 
         # log_prob = model(torch.cat((textf, acouf, visuf), dim=-1), qmask, umask)
         log_prob, alpha, alpha_f, alpha_b = model(torch.cat((textf, visuf,acouf), dim=-1), qmask, umask)

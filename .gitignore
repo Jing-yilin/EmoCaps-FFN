@@ -1,0 +1,12 @@
+
+# output
+output/GAN_loss.csv
+output/GAN_loss.png
+
+# GAN_save
+GAN_save/acoustic_disc.pth
+GAN_save/acoustic_gen.pth
+GAN_save/text_disc.pth
+GAN_save/text_gen.pth
+GAN_save/visual_disc.pth
+GAN_save/visual_gen.pth
